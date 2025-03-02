@@ -364,6 +364,27 @@ def merge_repeats(path, transcript):
     return segments
 
 
+def safe_min(values):
+    """Get min value safely handling NaN or empty values"""
+    if len(values) == 0:
+        return None
+    try:
+        min_val = values.min()
+        return None if pd.isna(min_val) else min_val
+    except:
+        return None
+
+
+def safe_max(values):
+    """Get max value safely handling NaN or empty values"""
+    if len(values) == 0:
+        return None
+    try:
+        max_val = values.max()
+        return None if pd.isna(max_val) else max_val
+    except:
+        return None
+
 def align(
     transcript: Iterable[SingleSegment],
     model: torch.nn.Module,
@@ -378,6 +399,7 @@ def align(
     num_workers: int = 4,  # For parallel preprocessing
     logger = None,
     beam_width: int = 2,  # Beam search width
+    max_retry: int = 2,    # Number of retries for model inference
 ) -> AlignedTranscriptionResult:
     """
     Optimized version of align function that uses batching and parallel processing
@@ -414,85 +436,120 @@ def align(
         if print_progress:
             print(message)
 
-    # Prepare audio input
-    if not torch.is_tensor(audio):
-        if isinstance(audio, str):
-            audio = load_audio(audio)
-        audio = torch.from_numpy(audio)
-    if len(audio.shape) == 1:
-        audio = audio.unsqueeze(0)
+    # Prepare audio input with better error handling
+    try:
+        if not torch.is_tensor(audio):
+            if isinstance(audio, str):
+                try:
+                    audio = load_audio(audio)
+                except Exception as e:
+                    log_message(f"Error loading audio file: {str(e)}", level="error")
+                    return {"segments": [], "word_segments": []}
+            audio = torch.from_numpy(audio)
+        if len(audio.shape) == 1:
+            audio = audio.unsqueeze(0)
+    except Exception as e:
+        log_message(f"Error processing audio input: {str(e)}", level="error")
+        return {"segments": [], "word_segments": []}
 
     MAX_DURATION = audio.shape[1] / SAMPLE_RATE
 
     model_dictionary = align_model_metadata["dictionary"]
     model_lang = align_model_metadata["language"]
     model_type = align_model_metadata["type"]
-
+    total_segments = len(transcript)
     start_time = time.time()
-    log_message(f"Starting optimized alignment with batch size {batch_size}", level="info")
-
-    # 1. Preprocess all segments in parallel
-    transcript_list = list(transcript)  # Ensure it's a list for indexing
-    total_segments = len(transcript_list)
+    # Handle empty transcript
+    transcript_list = list(transcript)
+    if len(transcript_list) == 0:
+        log_message("Empty transcript provided", level="warning")
+        return {"segments": [], "word_segments": []}
 
     def preprocess_segment(sdx):
-        segment = transcript_list[sdx]
-        # strip spaces at beginning / end, but keep track of the amount.
-        num_leading = len(segment["text"]) - len(segment["text"].lstrip())
-        num_trailing = len(segment["text"]) - len(segment["text"].rstrip())
-        text = segment["text"]
+        try:
+            segment = transcript_list[sdx]
+            # strip spaces at beginning / end, but keep track of the amount.
+            num_leading = len(segment["text"]) - len(segment["text"].lstrip())
+            num_trailing = len(segment["text"]) - len(segment["text"].rstrip())
+            text = segment["text"]
 
-        # split into words
-        if model_lang not in LANGUAGES_WITHOUT_SPACES:
-            per_word = text.split(" ")
-        else:
-            per_word = text
+            # Handle empty text or extremely short text
+            if len(text.strip()) == 0:
+                return sdx, {
+                    "can_align": False,
+                    "reason": "empty_text"
+                }
 
-        clean_char, clean_cdx = [], []
-        for cdx, char in enumerate(text):
-            char_ = char.lower()
-            # wav2vec2 models use "|" character to represent spaces
+            # Check for excessively long segments (warning only)
+            if segment["end"] - segment["start"] > 30.0:  # 30 seconds
+                log_message(f"Segment {sdx} is very long ({segment['end'] - segment['start']:.1f}s), " 
+                            f"alignment may be less accurate", level="warning")
+
+            # split into words
             if model_lang not in LANGUAGES_WITHOUT_SPACES:
-                char_ = char_.replace(" ", "|")
-
-            # ignore whitespace at beginning and end of transcript
-            if cdx < num_leading:
-                pass
-            elif cdx > len(text) - num_trailing - 1:
-                pass
-            elif char_ in model_dictionary.keys():
-                clean_char.append(char_)
-                clean_cdx.append(cdx)
+                per_word = text.split(" ")
             else:
-                # add placeholder
-                clean_char.append('*')
-                clean_cdx.append(cdx)
+                per_word = text
 
-        clean_wdx = []
-        for wdx, wrd in enumerate(per_word):
-            if any([c in model_dictionary.keys() for c in wrd.lower()]):
-                clean_wdx.append(wdx)
-            else:
-                # index for placeholder
-                clean_wdx.append(wdx)
+            clean_char, clean_cdx = [], []
+            for cdx, char in enumerate(text):
+                try:
+                    char_ = char.lower()
+                    # wav2vec2 models use "|" character to represent spaces
+                    if model_lang not in LANGUAGES_WITHOUT_SPACES:
+                        char_ = char_.replace(" ", "|")
 
-        punkt_param = PunktParameters()
-        punkt_param.abbrev_types = set(PUNKT_ABBREVIATIONS)
-        sentence_splitter = PunktSentenceTokenizer(punkt_param)
-        sentence_spans = list(sentence_splitter.span_tokenize(text))
+                    # ignore whitespace at beginning and end of transcript
+                    if cdx < num_leading:
+                        pass
+                    elif cdx > len(text) - num_trailing - 1:
+                        pass
+                    elif char_ in model_dictionary.keys():
+                        clean_char.append(char_)
+                        clean_cdx.append(cdx)
+                    else:
+                        # add placeholder
+                        clean_char.append('*')
+                        clean_cdx.append(cdx)
+                except Exception as char_e:
+                    # Handle individual character errors gracefully
+                    log_message(f"Error processing character at position {cdx}: {char_e}", level="debug")
+                    clean_char.append('*')
+                    clean_cdx.append(cdx)
 
-        text_clean = "".join(clean_char)
-        tokens = [model_dictionary.get(c, -1) for c in text_clean]
+            clean_wdx = []
+            for wdx, wrd in enumerate(per_word):
+                if any([c in model_dictionary.keys() for c in wrd.lower()]):
+                    clean_wdx.append(wdx)
+                else:
+                    # index for placeholder
+                    clean_wdx.append(wdx)
 
-        return sdx, {
-            "clean_char": clean_char,
-            "clean_cdx": clean_cdx,
-            "clean_wdx": clean_wdx,
-            "sentence_spans": sentence_spans,
-            "text_clean": text_clean,
-            "can_align": len(clean_char) > 0 and segment["start"] < MAX_DURATION,
-            "tokens": tokens
-        }
+            try:
+                punkt_param = PunktParameters()
+                punkt_param.abbrev_types = set(PUNKT_ABBREVIATIONS)
+                sentence_splitter = PunktSentenceTokenizer(punkt_param)
+                sentence_spans = list(sentence_splitter.span_tokenize(text))
+            except Exception as e:
+                # Fallback if sentence splitting fails
+                log_message(f"Sentence splitting failed for segment {sdx}, using whole segment as one sentence", level="debug")
+                sentence_spans = [(0, len(text))]
+
+            text_clean = "".join(clean_char)
+            tokens = [model_dictionary.get(c, -1) for c in text_clean]
+
+            return sdx, {
+                "clean_char": clean_char,
+                "clean_cdx": clean_cdx,
+                "clean_wdx": clean_wdx,
+                "sentence_spans": sentence_spans,
+                "text_clean": text_clean,
+                "can_align": len(clean_char) > 0 and segment["start"] < MAX_DURATION,
+                "tokens": tokens
+            }
+        except Exception as e:
+            log_message(f"Error in preprocessing segment {sdx}: {e}", level="warning")
+            return sdx, {"can_align": False, "reason": str(e)}
 
     # Use ThreadPoolExecutor for preprocessing
     segment_data = {}
@@ -626,10 +683,21 @@ def align(
                 if char == '[pad]' or char == '<pad>':
                     blank_id = code
 
-            # Get trellis and path
-            tokens = segment_data[segment_idx]["tokens"]
-            trellis = get_trellis(emission, tokens, blank_id)
-            path = backtrack_beam(trellis, emission, tokens, blank_id, beam_width=beam_width)
+            # Get trellis and path with better error handling
+            try:
+                tokens = segment_data[segment_idx]["tokens"]
+                trellis = get_trellis(emission, tokens, blank_id)
+            except Exception as e:
+                log_message(f'Error in trellis calculation for segment "{segment["text"]}": {str(e)}', level="error")
+                aligned_segments[segment_idx] = aligned_seg
+                continue
+
+            try:
+                path = backtrack_beam(trellis, emission, tokens, blank_id, beam_width=beam_width)
+            except Exception as e:
+                log_message(f'Error in backtracking for segment "{segment["text"]}": {str(e)}', level="error")
+                aligned_segments[segment_idx] = aligned_seg
+                continue
 
             if path is None:
                 log_message(f'Failed to align segment "{segment["text"]}": backtrack failed', level="warning")
@@ -701,18 +769,21 @@ def align(
                         # dont use space character for alignment
                         word_chars = word_chars[word_chars["char"] != " "]
 
-                        word_start = word_chars["start"].min()
-                        word_end = word_chars["end"].max()
-                        word_score = round(word_chars["score"].mean(), 3)
+                        word_start = safe_min(word_chars["start"])
+                        word_end = safe_max(word_chars["end"])
+
+                        # Calculate score carefully to avoid NaN issues
+                        valid_scores = word_chars["score"].dropna()
+                        word_score = round(valid_scores.mean(), 3) if len(valid_scores) > 0 else None
 
                         # -1 indicates unalignable
                         word_segment = {"word": word_text}
 
-                        if not np.isnan(word_start):
+                        if word_start is not None:
                             word_segment["start"] = word_start
-                        if not np.isnan(word_end):
+                        if word_end is not None:
                             word_segment["end"] = word_end
-                        if not np.isnan(word_score):
+                        if word_score is not None:
                             word_segment["score"] = word_score
 
                         sentence_words.append(word_segment)
@@ -732,19 +803,34 @@ def align(
                         aligned_subsegments[-1]["chars"] = curr_chars
 
                 aligned_subsegments = pd.DataFrame(aligned_subsegments)
-                aligned_subsegments["start"] = interpolate_nans(aligned_subsegments["start"], method=interpolate_method)
-                aligned_subsegments["end"] = interpolate_nans(aligned_subsegments["end"], method=interpolate_method)
+                # Make sure we have valid start/end timestamps
+                if len(aligned_subsegments) > 0:
+                    # Handle interpolation carefully
+                    try:
+                        aligned_subsegments["start"] = interpolate_nans(aligned_subsegments["start"], method=interpolate_method)
+                        aligned_subsegments["end"] = interpolate_nans(aligned_subsegments["end"], method=interpolate_method)
+                    except Exception as e:
+                        log_message(f"Error interpolating timestamps: {e}. Using original segment timestamps.", level="warning")
+                        # Fallback to segment timestamps if interpolation fails
+                        aligned_subsegments["start"] = aligned_subsegments["start"].fillna(segment["start"])
+                        aligned_subsegments["end"] = aligned_subsegments["end"].fillna(segment["end"])
 
-                # concatenate sentences with same timestamps
-                agg_dict = {"text": " ".join, "words": "sum"}
-                if model_lang in LANGUAGES_WITHOUT_SPACES:
-                    agg_dict["text"] = "".join
-                if return_char_alignments:
-                    agg_dict["chars"] = "sum"
-                aligned_subsegments = aligned_subsegments.groupby(["start", "end"], as_index=False).agg(agg_dict)
-                aligned_subsegments = aligned_subsegments.to_dict('records')
+                    # concatenate sentences with same timestamps
+                    try:
+                        agg_dict = {"text": " ".join, "words": "sum"}
+                        if model_lang in LANGUAGES_WITHOUT_SPACES:
+                            agg_dict["text"] = "".join
+                        if return_char_alignments:
+                            agg_dict["chars"] = "sum"
+                        aligned_subsegments = aligned_subsegments.groupby(["start", "end"], as_index=False).agg(agg_dict)
+                    except Exception as e:
+                        log_message(f"Error grouping sentences: {e}. Using individual sentences.", level="warning")
 
-                aligned_segments[segment_idx] = aligned_subsegments
+                    aligned_subsegments = aligned_subsegments.to_dict('records')
+                    aligned_segments[segment_idx] = aligned_subsegments
+                else:
+                    log_message(f"No valid subsegments for segment {segment_idx}", level="warning")
+                    aligned_segments[segment_idx] = aligned_seg
 
             except Exception as e:
                 log_message(f'Error processing aligned characters for segment "{segment["text"]}": {str(e)}',
