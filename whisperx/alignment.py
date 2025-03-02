@@ -136,15 +136,21 @@ def create_batches(transcript, segment_data, max_batch_size=8, max_duration_diff
 
     batches = []
     current_batch = []
+    current_batch_duration = None
 
     for idx, segment, duration in segment_info:
         # Check if we should start a new batch
         if (len(current_batch) >= max_batch_size or
-                (current_batch and abs(duration - current_batch[0][2]) > max_duration_diff)):
+                (current_batch and current_batch_duration is not None and abs(
+                    duration - current_batch_duration) > max_duration_diff)):
             batches.append(current_batch)
             current_batch = []
+            current_batch_duration = None
 
         current_batch.append((idx, segment))
+        # Set the reference duration for the first item in batch
+        if current_batch_duration is None:
+            current_batch_duration = duration
 
     # Add the last batch if not empty
     if current_batch:
@@ -444,7 +450,7 @@ def process_aligned_segment(
         return_char_alignments,
         interpolate_method,
         log_message
-):
+) -> None:
     """
     Process a single segment's alignment after model inference.
 
@@ -601,6 +607,7 @@ def process_aligned_segment(
         log_message(f'Error processing aligned characters for segment {sdx} ("{segment["text"]}"): {str(e)}',
                     level="error")
         aligned_segments[sdx] = aligned_seg
+
 
 """
 source: https://pytorch.org/tutorials/intermediate/forced_alignment_with_torchaudio_tutorial.html
