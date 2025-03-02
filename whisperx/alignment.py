@@ -147,7 +147,18 @@ def align(
             audio = load_audio(audio)
         audio = torch.from_numpy(audio)
     if len(audio.shape) == 1:
+        # Single dimension - add batch dimension
+
         audio = audio.unsqueeze(0)
+        log_message(f"Warning: Audio has unexpected initial shape=1, reshaping to {audio.shape}", level="warning")
+    elif len(audio.shape) > 2:
+        # More than 2 dimensions - just keep first two
+        log_message(f"Warning: Audio has unexpected shape {audio.shape}, reshaping", level="warning")
+        audio = audio.reshape(1, -1)
+
+    # Double-check shape before proceeding
+    if len(audio.shape) != 2:
+        raise ValueError(f"After reshaping, audio has invalid shape {audio.shape}, expected 2D tensor")
 
     MAX_DURATION = audio.shape[1] / SAMPLE_RATE
 
