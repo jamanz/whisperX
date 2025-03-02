@@ -107,6 +107,411 @@ def load_align_model(language_code: str, device: Union[str, List[str]], model_na
 
 
 def align(
+        transcript: Iterable[SingleSegment],
+        model: Union[torch.nn.Module, Dict[str, torch.nn.Module]],
+        align_model_metadata: dict,
+        audio: Union[str, np.ndarray, torch.Tensor],
+        device: Union[str, List[str]],
+        interpolate_method: str = "nearest",
+        return_char_alignments: bool = False,
+        print_progress: bool = False,
+        combined_progress: bool = False,
+        logger=None,
+) -> AlignedTranscriptionResult:
+    """
+    Align phoneme recognition predictions to known transcription.
+    Now supports multi-GPU processing when device is a list of device strings.
+    """
+    import time
+    start_time_total = time.time()
+
+    # Helper function to log messages
+    def log_message(message, level="info"):
+        if logger:
+            if level == "info":
+                logger.info(message)
+            elif level == "warning":
+                logger.warning(message)
+            elif level == "error":
+                logger.error(message)
+            elif level == "debug":
+                logger.debug(message)
+        if print_progress:
+            print(message)
+
+    # Check if we're using multiple devices
+    multi_device = isinstance(device, list)
+    devices = device if multi_device else [device]
+    models = model if multi_device else {devices[0]: model}
+
+    log_message(f"Using {'multiple devices' if multi_device else 'single device'}: {devices}")
+
+    # Time loading and preparing audio
+    start_time_audio = time.time()
+    if not torch.is_tensor(audio):
+        if isinstance(audio, str):
+            audio = load_audio(audio)
+        audio = torch.from_numpy(audio)
+    if len(audio.shape) == 1:
+        audio = audio.unsqueeze(0)
+
+    audio_prep_time = time.time() - start_time_audio
+    log_message(f"Audio preparation took {audio_prep_time:.4f} seconds")
+
+    MAX_DURATION = audio.shape[1] / SAMPLE_RATE
+
+    model_dictionary = align_model_metadata["dictionary"]
+    model_lang = align_model_metadata["language"]
+    model_type = align_model_metadata["type"]
+
+    # 1. Preprocess to keep only characters in dictionary
+    start_time_preprocess = time.time()
+    transcript_list = list(transcript)  # Convert to list if it's an iterator
+    total_segments = len(transcript_list)
+
+    # Store temporary processing values
+    segment_data: dict[int, SegmentData] = {}
+    for sdx, segment in enumerate(transcript_list):
+        # Progress reporting
+        if print_progress:
+            base_progress = ((sdx + 1) / total_segments) * 100
+            percent_complete = (50 + base_progress / 2) if combined_progress else base_progress
+            log_message(f"Preprocessing Progress: {percent_complete:.2f}%...")
+
+        num_leading = len(segment["text"]) - len(segment["text"].lstrip())
+        num_trailing = len(segment["text"]) - len(segment["text"].rstrip())
+        text = segment["text"]
+
+        # split into words
+        if model_lang not in LANGUAGES_WITHOUT_SPACES:
+            per_word = text.split(" ")
+        else:
+            per_word = text
+
+        clean_char, clean_cdx = [], []
+        for cdx, char in enumerate(text):
+            char_ = char.lower()
+            # wav2vec2 models use "|" character to represent spaces
+            if model_lang not in LANGUAGES_WITHOUT_SPACES:
+                char_ = char_.replace(" ", "|")
+
+            # ignore whitespace at beginning and end of transcript
+            if cdx < num_leading:
+                pass
+            elif cdx > len(text) - num_trailing - 1:
+                pass
+            elif char_ in model_dictionary.keys():
+                clean_char.append(char_)
+                clean_cdx.append(cdx)
+            else:
+                # add placeholder
+                clean_char.append('*')
+                clean_cdx.append(cdx)
+
+        clean_wdx = []
+        for wdx, wrd in enumerate(per_word):
+            if any([c in model_dictionary.keys() for c in wrd.lower()]):
+                clean_wdx.append(wdx)
+            else:
+                # index for placeholder
+                clean_wdx.append(wdx)
+
+        punkt_param = PunktParameters()
+        punkt_param.abbrev_types = set(PUNKT_ABBREVIATIONS)
+        sentence_splitter = PunktSentenceTokenizer(punkt_param)
+        sentence_spans = list(sentence_splitter.span_tokenize(text))
+
+        segment_data[sdx] = {
+            "clean_char": clean_char,
+            "clean_cdx": clean_cdx,
+            "clean_wdx": clean_wdx,
+            "sentence_spans": sentence_spans
+        }
+
+    preprocess_time = time.time() - start_time_preprocess
+    log_message(f"Preprocessing took {preprocess_time:.4f} seconds for {total_segments} segments")
+
+    aligned_segments: List[SingleAlignedSegment] = []
+
+    # Time for the main alignment loop
+    start_time_alignment = time.time()
+    model_inference_time_total = 0
+    trellis_time_total = 0
+    backtrack_time_total = 0
+    postprocess_time_total = 0
+
+    # Process segments in alternating fashion across GPUs
+    num_devices = len(devices)
+    for sdx, segment in enumerate(transcript_list):
+        segment_start_time = time.time()
+
+        # Determine which device to use for this segment
+        device_idx = sdx % num_devices
+        current_device = devices[device_idx]
+        current_model = models[current_device]
+
+        if print_progress:
+            progress = ((sdx + 1) / total_segments) * 100
+            log_message(f"Alignment Progress: {progress:.2f}% (using device {current_device})...")
+
+        t1 = segment["start"]
+        t2 = segment["end"]
+        text = segment["text"]
+
+        aligned_seg: SingleAlignedSegment = {
+            "start": t1,
+            "end": t2,
+            "text": text,
+            "words": [],
+            "chars": None,
+        }
+
+        if return_char_alignments:
+            aligned_seg["chars"] = []
+
+        # check we can align
+        if len(segment_data[sdx]["clean_char"]) == 0:
+            log_message(f'Failed to align segment ("{segment["text"]}"): '
+                        f'no characters in this segment found in model dictionary, '
+                        f'resorting to original...', level="warning")
+            aligned_segments.append(aligned_seg)
+            continue
+
+        if t1 >= MAX_DURATION:
+            log_message(f'Failed to align segment ("{segment["text"]}"): '
+                        f'original start time longer than audio duration, skipping...', level="warning")
+            aligned_segments.append(aligned_seg)
+            continue
+
+        text_clean = "".join(segment_data[sdx]["clean_char"])
+        tokens = [model_dictionary.get(c, -1) for c in text_clean]
+
+        f1 = int(t1 * SAMPLE_RATE)
+        f2 = int(t2 * SAMPLE_RATE)
+
+        # Move audio segment to the appropriate device
+        audio_to_device_start = time.time()
+        waveform_segment = audio[:, f1:f2].to(current_device)
+        audio_to_device_time = time.time() - audio_to_device_start
+
+        # Handle the minimum input length for wav2vec2 models
+        if waveform_segment.shape[-1] < 400:
+            lengths = torch.as_tensor([waveform_segment.shape[-1]]).to(current_device)
+            waveform_segment = torch.nn.functional.pad(
+                waveform_segment, (0, 400 - waveform_segment.shape[-1])
+            )
+        else:
+            lengths = None
+
+        # Time model inference
+        model_inference_start = time.time()
+        with torch.inference_mode():
+            try:
+                if model_type == "torchaudio":
+                    emissions, _ = current_model(waveform_segment, lengths=lengths)
+                elif model_type == "huggingface":
+                    emissions = current_model(waveform_segment).logits
+                else:
+                    raise NotImplementedError(f"Align model of type {model_type} not supported.")
+                emissions = torch.log_softmax(emissions, dim=-1)
+            except Exception as e:
+                log_message(f'Failed to get model predictions for segment ("{segment["text"]}"): {str(e)}',
+                            level="error")
+                aligned_segments.append(aligned_seg)
+                continue
+        model_inference_time = time.time() - model_inference_start
+        model_inference_time_total += model_inference_time
+
+        emission = emissions[0].cpu().detach()
+
+        blank_id = 0
+        for char, code in model_dictionary.items():
+            if char == '[pad]' or char == '<pad>':
+                blank_id = code
+
+        # Time trellis computation
+        trellis_start = time.time()
+        trellis = get_trellis(emission, tokens, blank_id)
+        trellis_time = time.time() - trellis_start
+        trellis_time_total += trellis_time
+
+        # Time backtracking
+        backtrack_start = time.time()
+        path = backtrack_beam(trellis, emission, tokens, blank_id, beam_width=2)
+        backtrack_time = time.time() - backtrack_start
+        backtrack_time_total += backtrack_time
+
+        if path is None:
+            log_message(f'Failed to align segment ("{segment["text"]}"): '
+                        f'backtrack failed, resorting to original...', level="warning")
+
+            aligned_segments.append(aligned_seg)
+            continue
+
+        # Time postprocessing
+        postprocess_start = time.time()
+        char_segments = merge_repeats(path, text_clean)
+
+        duration = t2 - t1
+        ratio = duration * waveform_segment.size(0) / (trellis.size(0) - 1)
+
+        # assign timestamps to aligned characters
+        char_segments_arr = []
+        word_idx = 0
+        for cdx, char in enumerate(text):
+            start, end, score = None, None, None
+            if cdx in segment_data[sdx]["clean_cdx"]:
+                char_seg = char_segments[segment_data[sdx]["clean_cdx"].index(cdx)]
+                start = round(char_seg.start * ratio + t1, 3)
+                end = round(char_seg.end * ratio + t1, 3)
+                score = round(char_seg.score, 3)
+
+            char_segments_arr.append(
+                {
+                    "char": char,
+                    "start": start,
+                    "end": end,
+                    "score": score,
+                    "word-idx": word_idx,
+                }
+            )
+
+            # increment word_idx, nltk word tokenization would probably be more robust here, but us space for now...
+            if model_lang in LANGUAGES_WITHOUT_SPACES:
+                word_idx += 1
+            elif cdx == len(text) - 1 or text[cdx + 1] == " ":
+                word_idx += 1
+
+        char_segments_arr = pd.DataFrame(char_segments_arr)
+
+        aligned_subsegments = []
+        # assign sentence_idx to each character index
+        try:
+            # assign sentence_idx to each character index
+            char_segments_arr["sentence-idx"] = None
+            for sdx2, (sstart, send) in enumerate(segment_data[sdx]["sentence_spans"]):
+                curr_chars = char_segments_arr.loc[
+                    (char_segments_arr.index >= sstart) & (char_segments_arr.index <= send)]
+                char_segments_arr.loc[
+                    (char_segments_arr.index >= sstart) & (char_segments_arr.index <= send), "sentence-idx"] = sdx2
+
+                sentence_text = text[sstart:send]
+                sentence_start = curr_chars["start"].min()
+                end_chars = curr_chars[curr_chars["char"] != ' ']
+                sentence_end = end_chars["end"].max()
+                sentence_words = []
+
+                for word_idx in curr_chars["word-idx"].unique():
+                    word_chars = curr_chars.loc[curr_chars["word-idx"] == word_idx]
+                    word_text = "".join(word_chars["char"].tolist()).strip()
+                    if len(word_text) == 0:
+                        continue
+
+                    # dont use space character for alignment
+                    word_chars = word_chars[word_chars["char"] != " "]
+
+                    word_start = word_chars["start"].min()
+                    word_end = word_chars["end"].max()
+                    word_score = round(word_chars["score"].mean(), 3)
+
+                    # -1 indicates unalignable
+                    word_segment = {"word": word_text}
+
+                    if not np.isnan(word_start):
+                        word_segment["start"] = word_start
+                    if not np.isnan(word_end):
+                        word_segment["end"] = word_end
+                    if not np.isnan(word_score):
+                        word_segment["score"] = word_score
+
+                    sentence_words.append(word_segment)
+
+                aligned_subsegments.append({
+                    "text": sentence_text,
+                    "start": sentence_start,
+                    "end": sentence_end,
+                    "words": sentence_words,
+                })
+
+                if return_char_alignments:
+                    curr_chars = curr_chars[["char", "start", "end", "score"]]
+                    curr_chars.fillna(-1, inplace=True)
+                    curr_chars = curr_chars.to_dict("records")
+                    curr_chars = [{key: val for key, val in char.items() if val != -1} for char in curr_chars]
+                    aligned_subsegments[-1]["chars"] = curr_chars
+
+            aligned_subsegments = pd.DataFrame(aligned_subsegments)
+            aligned_subsegments["start"] = interpolate_nans(aligned_subsegments["start"], method=interpolate_method)
+            aligned_subsegments["end"] = interpolate_nans(aligned_subsegments["end"], method=interpolate_method)
+            # concatenate sentences with same timestamps
+            agg_dict = {"text": " ".join, "words": "sum"}
+            if model_lang in LANGUAGES_WITHOUT_SPACES:
+                agg_dict["text"] = "".join
+            if return_char_alignments:
+                agg_dict["chars"] = "sum"
+            aligned_subsegments = aligned_subsegments.groupby(["start", "end"], as_index=False).agg(agg_dict)
+            aligned_subsegments = aligned_subsegments.to_dict('records')
+            aligned_segments += aligned_subsegments
+        except Exception as e:
+            log_message(f'Error processing aligned characters for segment ("{segment["text"]}"): {str(e)}',
+                        level="error")
+            aligned_segments.append(aligned_seg)
+            continue
+
+        postprocess_time = time.time() - postprocess_start
+        postprocess_time_total += postprocess_time
+
+        segment_total_time = time.time() - segment_start_time
+        if print_progress:
+            log_message(f"Segment {sdx + 1}/{total_segments} timing: "
+                        f"Total: {segment_total_time:.4f}s, "
+                        f"Audio to device: {audio_to_device_time:.4f}s, "
+                        f"Model inference: {model_inference_time:.4f}s, "
+                        f"Trellis: {trellis_time:.4f}s, "
+                        f"Backtrack: {backtrack_time:.4f}s, "
+                        f"Postprocess: {postprocess_time:.4f}s")
+
+    alignment_time = time.time() - start_time_alignment
+
+    # create word_segments list
+    word_segments: List[SingleWordSegment] = []
+    for segment in aligned_segments:
+        word_segments += segment["words"]
+
+    total_time = time.time() - start_time_total
+
+    # Log overall timing statistics
+    log_message("Performance Metrics:", level="info")
+    log_message(f"Total execution time: {total_time:.4f} seconds", level="info")
+    log_message(f"Audio preparation: {audio_prep_time:.4f} seconds ({audio_prep_time / total_time * 100:.2f}%)",
+                level="info")
+    log_message(f"Preprocessing: {preprocess_time:.4f} seconds ({preprocess_time / total_time * 100:.2f}%)",
+                level="info")
+    log_message(f"Alignment: {alignment_time:.4f} seconds ({alignment_time / total_time * 100:.2f}%)", level="info")
+    log_message(
+        f"  - Model inference: {model_inference_time_total:.4f} seconds ({model_inference_time_total / total_time * 100:.2f}%)",
+        level="info")
+    log_message(
+        f"  - Trellis computation: {trellis_time_total:.4f} seconds ({trellis_time_total / total_time * 100:.2f}%)",
+        level="info")
+    log_message(
+        f"  - Backtracking: {backtrack_time_total:.4f} seconds ({backtrack_time_total / total_time * 100:.2f}%)",
+        level="info")
+    log_message(
+        f"  - Postprocessing: {postprocess_time_total:.4f} seconds ({postprocess_time_total / total_time * 100:.2f}%)",
+        level="info")
+
+    if multi_device:
+        log_message(
+            f"Using {len(devices)} devices, average time per segment: {alignment_time / total_segments:.4f} seconds",
+            level="info")
+
+    log_message(f"Alignment completed. Processed {len(aligned_segments)} segments with {len(word_segments)} words.",
+                level="info")
+    return {"segments": aligned_segments, "word_segments": word_segments}
+
+
+def align0(
     transcript: Iterable[SingleSegment],
     model: Union[torch.nn.Module, Dict[str, torch.nn.Module]],
     align_model_metadata: dict,
