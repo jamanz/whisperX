@@ -6,7 +6,7 @@ import os
 import time
 from dataclasses import dataclass
 from typing import Iterable, Optional, Union, List
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 
 import numpy as np
@@ -504,7 +504,7 @@ def align(
     if num_workers > 1:
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
             futures = [executor.submit(preprocess_segment, i) for i in range(total_segments)]
-            for future in executor.as_completed(futures):
+            for future in as_completed(futures):
                 idx, data = future.result()
                 segment_data[idx] = data
                 if print_progress and len(segment_data) % max(1, total_segments // 10) == 0:
