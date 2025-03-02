@@ -54,13 +54,11 @@ DEFAULT_ALIGN_MODELS_HF = {
 QUANTIZED_MODELS_DIR = os.environ.get("QUANTIZED_MODELS_DIR", "./quantized_models")
 os.makedirs(QUANTIZED_MODELS_DIR, exist_ok=True)
 
-
 @dataclass
 class Point:
     token_index: int
     time_index: int
     score: float
-
 
 @dataclass
 class Segment:
@@ -76,7 +74,6 @@ class Segment:
     def length(self):
         return self.end - self.start
 
-
 @dataclass
 class BeamState:
     """State in beam search."""
@@ -87,11 +84,11 @@ class BeamState:
 
 
 def load_align_model(
-        language_code: str,
-        device: str,
-        model_name: Optional[str] = None,
-        model_dir=None,
-        use_quantized: bool = True
+    language_code: str,
+    device: str,
+    model_name: Optional[str] = None,
+    model_dir=None,
+    use_quantized: bool = True
 ):
     """
     Load and optimize the alignment model for the specified language.
@@ -225,8 +222,8 @@ def process_batch(model, waveform_batch, lengths_batch, model_type, device):
             # Fall back to processing one by one if batch fails
             results = []
             for i in range(waveform_batch.shape[0]):
-                waveform = waveform_batch[i:i + 1]
-                length = None if lengths_batch is None else lengths_batch[i:i + 1]
+                waveform = waveform_batch[i:i+1]
+                length = None if lengths_batch is None else lengths_batch[i:i+1]
                 if model_type == "torchaudio":
                     emission, _ = model(waveform.to(device), lengths=length)
                 else:
@@ -268,7 +265,7 @@ def get_wildcard_emission(frame_emission, tokens, blank_id):
     regular_scores = frame_emission[tokens.clamp(min=0)]  # clamp to avoid -1 index
 
     # Create a mask and compute the maximum value without modifying frame_emission
-    max_valid_score = frame_emission.clone()  # Create a copy
+    max_valid_score = frame_emission.clone()   # Create a copy
     max_valid_score[blank_id] = float('-inf')  # Modify the copy to exclude the blank token
     max_valid_score = max_valid_score.max()
 
@@ -368,19 +365,19 @@ def merge_repeats(path, transcript):
 
 
 def align(
-        transcript: Iterable[SingleSegment],
-        model: torch.nn.Module,
-        align_model_metadata: dict,
-        audio: Union[str, np.ndarray, torch.Tensor],
-        device: str,
-        batch_size: int = 8,  # Adjust based on GPU memory
-        interpolate_method: str = "nearest",
-        return_char_alignments: bool = False,
-        print_progress: bool = False,
-        combined_progress: bool = False,
-        num_workers: int = 4,  # For parallel preprocessing
-        logger=None,
-        beam_width: int = 2,  # Beam search width
+    transcript: Iterable[SingleSegment],
+    model: torch.nn.Module,
+    align_model_metadata: dict,
+    audio: Union[str, np.ndarray, torch.Tensor],
+    device: str,
+    batch_size: int = 8,  # Adjust based on GPU memory
+    interpolate_method: str = "nearest",
+    return_char_alignments: bool = False,
+    print_progress: bool = False,
+    combined_progress: bool = False,
+    num_workers: int = 4,  # For parallel preprocessing
+    logger = None,
+    beam_width: int = 2,  # Beam search width
 ) -> AlignedTranscriptionResult:
     """
     Optimized version of align function that uses batching and parallel processing
@@ -403,7 +400,6 @@ def align(
     Returns:
         AlignedTranscriptionResult: Dictionary with aligned segments and word segments
     """
-
     # Helper function for logging
     def log_message(message, level="info"):
         if logger:
@@ -508,52 +504,89 @@ def align(
                 idx, data = future.result()
                 segment_data[idx] = data
                 if print_progress and len(segment_data) % max(1, total_segments // 10) == 0:
-                    log_message(f"Preprocessing progress: {len(segment_data) / total_segments * 100:.1f}%",
-                                level="debug")
+                    log_message(f"Preprocessing progress: {len(segment_data) / total_segments * 100:.1f}%", level="debug")
     else:
         for i in range(total_segments):
             idx, data = preprocess_segment(i)
             segment_data[idx] = data
-            if print_progress and (i + 1) % max(1, total_segments // 10) == 0:
-                log_message(f"Preprocessing progress: {(i + 1) / total_segments * 100:.1f}%", level="debug")
+            if print_progress and (i+1) % max(1, total_segments // 10) == 0:
+                log_message(f"Preprocessing progress: {(i+1) / total_segments * 100:.1f}%", level="debug")
 
     # 2. Group segments for batch processing
     batches = []
     batch_indices = []
-    current_batch = []
-    current_indices = []
+    batch_lengths = []
+    segment_groups = {}  # Group segments by similar length to improve batching efficiency
 
+    # First, group segments by similar length (rounded to nearest second)
     for idx in range(total_segments):
         if not segment_data[idx]["can_align"]:
             continue
 
         segment = transcript_list[idx]
-        t1 = segment["start"]
-        t2 = segment["end"]
-        f1 = int(t1 * SAMPLE_RATE)
-        f2 = int(t2 * SAMPLE_RATE)
+        duration = int(round((segment["end"] - segment["start"]) * SAMPLE_RATE / 1000))  # Length in frames, rounded
+        if duration not in segment_groups:
+            segment_groups[duration] = []
+        segment_groups[duration].append(idx)
 
-        waveform_segment = audio[:, f1:f2]
-        # Pad if needed
-        if waveform_segment.shape[-1] < 400:
-            waveform_segment = torch.nn.functional.pad(
-                waveform_segment, (0, 400 - waveform_segment.shape[-1])
-            )
+    # Process each length group
+    for _, indices in segment_groups.items():
+        current_batch = []
+        current_indices = []
+        current_lengths = []
 
-        current_batch.append(waveform_segment)
-        current_indices.append(idx)
+        for idx in indices:
+            segment = transcript_list[idx]
+            t1 = segment["start"]
+            t2 = segment["end"]
+            f1 = int(t1 * SAMPLE_RATE)
+            f2 = int(t2 * SAMPLE_RATE)
 
-        if len(current_batch) >= batch_size:
-            # Process this batch
-            batches.append(torch.cat(current_batch, dim=0))
+            waveform_segment = audio[:, f1:f2]
+            # Handle minimum length requirement
+            if waveform_segment.shape[-1] < 400:
+                waveform_segment = torch.nn.functional.pad(
+                    waveform_segment, (0, 400 - waveform_segment.shape[-1])
+                )
+
+            current_batch.append(waveform_segment)
+            current_indices.append(idx)
+            current_lengths.append(waveform_segment.shape[-1])
+
+            if len(current_batch) >= batch_size:
+                # Pad all segments to the maximum length in this batch
+                max_length = max(current_lengths)
+                padded_batch = []
+                for i, segment in enumerate(current_batch):
+                    if segment.shape[-1] < max_length:
+                        segment = torch.nn.functional.pad(
+                            segment, (0, max_length - segment.shape[-1])
+                        )
+                    padded_batch.append(segment)
+
+                # Process this batch
+                batches.append(torch.cat(padded_batch, dim=0))
+                batch_indices.append(current_indices)
+                batch_lengths.append(current_lengths)
+                current_batch = []
+                current_indices = []
+                current_lengths = []
+
+        # Add remaining segments in this length group
+        if current_batch:
+            # Pad all segments to the maximum length in this batch
+            max_length = max(current_lengths)
+            padded_batch = []
+            for i, segment in enumerate(current_batch):
+                if segment.shape[-1] < max_length:
+                    segment = torch.nn.functional.pad(
+                        segment, (0, max_length - segment.shape[-1])
+                    )
+                padded_batch.append(segment)
+
+            batches.append(torch.cat(padded_batch, dim=0))
             batch_indices.append(current_indices)
-            current_batch = []
-            current_indices = []
-
-    # Add remaining segments
-    if current_batch:
-        batches.append(torch.cat(current_batch, dim=0))
-        batch_indices.append(current_indices)
+            batch_lengths.append(current_lengths)
 
     # 3. Process batches
     aligned_segments = [None] * total_segments
@@ -562,8 +595,7 @@ def align(
         if print_progress:
             base_progress = ((batch_idx + 1) / len(batches)) * 100
             percent_complete = (50 + base_progress / 2) if combined_progress else base_progress
-            log_message(f"Processing batch {batch_idx + 1}/{len(batches)} - Progress: {percent_complete:.2f}%...",
-                        level="info")
+            log_message(f"Processing batch {batch_idx+1}/{len(batches)} - Progress: {percent_complete:.2f}%...", level="info")
 
         # Get model predictions for the batch
         batch_start_time = time.time()
@@ -639,7 +671,7 @@ def align(
                 # Increment word_idx
                 if model_lang in LANGUAGES_WITHOUT_SPACES:
                     word_idx += 1
-                elif cdx == len(text) - 1 or text[cdx + 1] == " ":
+                elif cdx == len(text) - 1 or text[cdx+1] == " ":
                     word_idx += 1
 
             char_segments_arr = pd.DataFrame(char_segments_arr)
@@ -716,7 +748,7 @@ def align(
 
             except Exception as e:
                 log_message(f'Error processing aligned characters for segment "{segment["text"]}": {str(e)}',
-                            level="error")
+                           level="error")
                 aligned_segments[segment_idx] = aligned_seg
 
         # Free memory explicitly
@@ -752,8 +784,7 @@ def align(
             word_segments.extend(segment["words"])
 
     total_time = time.time() - start_time
-    log_message(
-        f"Alignment completed in {total_time:.2f} seconds. Processed {len(final_aligned_segments)} segments with {len(word_segments)} words.",
-        level="info")
+    log_message(f"Alignment completed in {total_time:.2f} seconds. Processed {len(final_aligned_segments)} segments with {len(word_segments)} words.",
+               level="info")
 
     return {"segments": final_aligned_segments, "word_segments": word_segments}
