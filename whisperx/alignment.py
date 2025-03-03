@@ -106,8 +106,8 @@ def load_align_model(language_code: str, device: Union[str, List[str]], model_na
     else:
         return models[devices[0]], align_metadata
 
-
-def align(
+# wrong end timestampts + long processing
+def align_batch(
         transcript: Iterable[SingleSegment],
         model: Union[torch.nn.Module, Dict[str, torch.nn.Module]],
         align_model_metadata: dict,
@@ -655,8 +655,8 @@ def align(
                 level="info")
     return {"segments": aligned_segments, "word_segments": word_segments}
 
-
-def align_best(
+# so far best version
+def align(
         transcript: Iterable[SingleSegment],
         model: Union[torch.nn.Module, Dict[str, torch.nn.Module]],
         align_model_metadata: dict,
@@ -1927,8 +1927,7 @@ class BeamState:
     path: List[Point]  # Path history
 
 
-# @nb.jit(nopython=True, parallel=True)
-
+@nb.jit(nopython=True, parallel=True)
 def backtrack_beam(trellis, emission, tokens, blank_id=0, beam_width=5):
     """Standard CTC beam search backtracking implementation."""
     T, J = trellis.size(0) - 1, trellis.size(1) - 1
