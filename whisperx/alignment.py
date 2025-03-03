@@ -360,7 +360,7 @@ def align(
             # CPU operations (outside the stream context for better overlap)
             # Time trellis computation
             trellis_start = time.time()
-            trellis = get_trellis(emission, tokens, blank_id)
+            trellis = get_trellis_numba(emission, tokens, blank_id)
             trellis_time = time.time() - trellis_start
             trellis_time_total += trellis_time
 
@@ -1274,63 +1274,42 @@ def align0(
     return {"segments": aligned_segments, "word_segments": word_segments}
 
 
-# Helper function to easily use multi-GPU alignment
-def align_with_multiple_gpus(
-    transcript: Iterable[SingleSegment],
-    language_code: str,
-    audio: Union[str, np.ndarray, torch.Tensor],
-    gpu_ids: List[int] = [0, 1],  # Default to using GPUs 0 and 1
-    model_name: Optional[str] = None,
-    model_dir=None,
-    interpolate_method: str = "nearest",
-    return_char_alignments: bool = False,
-    print_progress: bool = False,
-    combined_progress: bool = False,
-    logger = None,
-):
-    """
-    Helper function to align transcripts using multiple GPUs.
-    
-    Args:
-        transcript: Iterable of transcript segments
-        language_code: Language code for model selection
-        audio: Audio input
-        gpu_ids: List of GPU IDs to use (default: [0, 1])
-        Other args: Same as original functions
-        
-    Returns:
-        AlignedTranscriptionResult with aligned segments
-    """
-    # Convert GPU IDs to device strings
-    devices = [f"cuda:{gpu_id}" for gpu_id in gpu_ids]
-    
-    # Ensure the devices exist
-    device_count = torch.cuda.device_count()
-    if max(gpu_ids) >= device_count:
-        raise ValueError(f"Requested GPU ID {max(gpu_ids)} but only {device_count} GPUs are available")
-    
-    # Load models on all specified devices
-    models, align_model_metadata = load_align_model(
-        language_code=language_code,
-        device=devices,
-        model_name=model_name,
-        model_dir=model_dir
-    )
-    
-    # Perform alignment
-    return align(
-        transcript=transcript,
-        model=models,
-        align_model_metadata=align_model_metadata,
-        audio=audio,
-        device=devices,
-        interpolate_method=interpolate_method,
-        return_char_alignments=return_char_alignments,
-        print_progress=print_progress,
-        combined_progress=combined_progress,
-        logger=logger
-    )
+@nb.jit(nopython=True)
+def get_trellis_numba(emission_np, tokens_np, blank_id=0):
+    """JIT-compiled trellis computation."""
+    num_frame = emission_np.shape[0]
+    num_tokens = len(tokens_np)
 
+    trellis = np.zeros((num_frame, num_tokens), dtype=np.float32)
+
+    # Initialize first row/column
+    trellis[1:, 0] = np.cumsum(emission_np[1:, blank_id])
+    trellis[0, 1:] = -np.inf
+    if num_frame >= num_tokens:
+        trellis[-num_tokens + 1:, 0] = np.inf
+
+    # Dynamic programming
+    for t in range(num_frame - 1):
+        for j in range(1, num_tokens):
+            # Score for staying
+            stay_score = trellis[t, j] + emission_np[t, blank_id]
+
+            # Score for changing
+            change_score = trellis[t, j - 1]
+            if tokens_np[j] == -1:  # Wildcard
+                # Find max emission excluding blank
+                valid_emissions = emission_np[t].copy()
+                valid_emissions[blank_id] = -np.inf
+                token_emission = np.max(valid_emissions)
+            else:
+                token_emission = emission_np[t, tokens_np[j]]
+
+            change_score += token_emission
+
+            # Take maximum
+            trellis[t + 1, j] = max(stay_score, change_score)
+
+    return trellis
 
 # The following functions are preserved from the original code
 def get_trellis(emission, tokens, blank_id=0):
