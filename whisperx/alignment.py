@@ -18,6 +18,7 @@ from .types import (
     SegmentData,
 )
 from nltk.tokenize.punkt import PunktSentenceTokenizer, PunktParameters
+import numba as nb
 
 PUNKT_ABBREVIATIONS = ['dr', 'vs', 'mr', 'mrs', 'prof']
 LANGUAGES_WITHOUT_SPACES = ["ja", "zh"]
@@ -1398,7 +1399,8 @@ class BeamState:
     path: List[Point]  # Path history
 
 
-def backtrack_beam0(trellis, emission, tokens, blank_id=0, beam_width=5):
+@nb.jit(nopython=True, parallel=True)
+def backtrack_beam(trellis, emission, tokens, blank_id=0, beam_width=5):
     """Standard CTC beam search backtracking implementation."""
     T, J = trellis.size(0) - 1, trellis.size(1) - 1
 
@@ -1468,92 +1470,92 @@ def backtrack_beam0(trellis, emission, tokens, blank_id=0, beam_width=5):
     return best_beam.path[::-1]
 
 
-def backtrack_beam(trellis, emission, tokens, blank_id=0, beam_width=5):
-    """Optimized CTC beam search backtracking implementation."""
-    T, J = trellis.size(0) - 1, trellis.size(1) - 1
-
-    # Pre-compute emission values to avoid redundant computation
-    emission_cpu = emission.cpu().numpy()
-    blank_emission = emission_cpu[:, blank_id]
-
-    # Initial beam
-    init_state = BeamState(
-        token_index=J,
-        time_index=T,
-        score=trellis[T, J].item(),  # Convert to Python float (faster)
-        path=[Point(J, T, math.exp(emission_cpu[T, blank_id]))]  # Pre-compute exp
-    )
-
-    beams = [init_state]
-
-    while beams and beams[0].token_index > 0:
-        next_beams = []
-
-        for beam in beams:
-            t, j = beam.time_index, beam.token_index
-
-            if t <= 0:
-                continue
-
-            # Get scores once (avoid repeated tensor indexing)
-            stay_score = trellis[t - 1, j].item()
-            change_score = trellis[t - 1, j - 1].item() if j > 0 else float('-inf')
-
-            # Handle token emissions efficiently
-            token_j = tokens[j] if j < len(tokens) else -1
-            if token_j == -1:
-                # For wildcard, find max emission excluding blank
-                valid_emissions = emission_cpu[t - 1].copy()
-                valid_emissions[blank_id] = float('-inf')
-                p_change = valid_emissions.max()
-            else:
-                p_change = emission_cpu[t - 1, token_j]
-
-            # Stay path - avoid unnecessary deep copies
-            if not math.isinf(stay_score):
-                new_path = list(beam.path)  # Shallow copy is much faster
-                new_path.append(Point(j, t - 1, math.exp(blank_emission[t - 1])))
-
-                next_beams.append(BeamState(
-                    token_index=j,
-                    time_index=t - 1,
-                    score=stay_score,
-                    path=new_path
-                ))
-
-            # Change path
-            if j > 0 and not math.isinf(change_score):
-                new_path = list(beam.path)
-                new_path.append(Point(j - 1, t - 1, math.exp(p_change)))
-
-                next_beams.append(BeamState(
-                    token_index=j - 1,
-                    time_index=t - 1,
-                    score=change_score,
-                    path=new_path
-                ))
-
-        # Use key function for faster sorting
-        if next_beams:
-            next_beams.sort(key=lambda x: x.score, reverse=True)
-            beams = next_beams[:beam_width]
-        else:
-            break
-
-    if not beams:
-        return None
-
-    # Process best beam
-    best_beam = beams[0]
-    t = best_beam.time_index
-    j = best_beam.token_index
-
-    # Complete path to t=0 efficiently (single loop)
-    while t > 0:
-        t -= 1
-        best_beam.path.append(Point(j, t, math.exp(blank_emission[t])))
-
-    return best_beam.path[::-1]
+# def backtrack_beam_attempt(trellis, emission, tokens, blank_id=0, beam_width=5):
+#     """Optimized CTC beam search backtracking implementation."""
+#     T, J = trellis.size(0) - 1, trellis.size(1) - 1
+#
+#     # Pre-compute emission values to avoid redundant computation
+#     emission_cpu = emission.cpu().numpy()
+#     blank_emission = emission_cpu[:, blank_id]
+#
+#     # Initial beam
+#     init_state = BeamState(
+#         token_index=J,
+#         time_index=T,
+#         score=trellis[T, J].item(),  # Convert to Python float (faster)
+#         path=[Point(J, T, math.exp(emission_cpu[T, blank_id]))]  # Pre-compute exp
+#     )
+#
+#     beams = [init_state]
+#
+#     while beams and beams[0].token_index > 0:
+#         next_beams = []
+#
+#         for beam in beams:
+#             t, j = beam.time_index, beam.token_index
+#
+#             if t <= 0:
+#                 continue
+#
+#             # Get scores once (avoid repeated tensor indexing)
+#             stay_score = trellis[t - 1, j].item()
+#             change_score = trellis[t - 1, j - 1].item() if j > 0 else float('-inf')
+#
+#             # Handle token emissions efficiently
+#             token_j = tokens[j] if j < len(tokens) else -1
+#             if token_j == -1:
+#                 # For wildcard, find max emission excluding blank
+#                 valid_emissions = emission_cpu[t - 1].copy()
+#                 valid_emissions[blank_id] = float('-inf')
+#                 p_change = valid_emissions.max()
+#             else:
+#                 p_change = emission_cpu[t - 1, token_j]
+#
+#             # Stay path - avoid unnecessary deep copies
+#             if not math.isinf(stay_score):
+#                 new_path = list(beam.path)  # Shallow copy is much faster
+#                 new_path.append(Point(j, t - 1, math.exp(blank_emission[t - 1])))
+#
+#                 next_beams.append(BeamState(
+#                     token_index=j,
+#                     time_index=t - 1,
+#                     score=stay_score,
+#                     path=new_path
+#                 ))
+#
+#             # Change path
+#             if j > 0 and not math.isinf(change_score):
+#                 new_path = list(beam.path)
+#                 new_path.append(Point(j - 1, t - 1, math.exp(p_change)))
+#
+#                 next_beams.append(BeamState(
+#                     token_index=j - 1,
+#                     time_index=t - 1,
+#                     score=change_score,
+#                     path=new_path
+#                 ))
+#
+#         # Use key function for faster sorting
+#         if next_beams:
+#             next_beams.sort(key=lambda x: x.score, reverse=True)
+#             beams = next_beams[:beam_width]
+#         else:
+#             break
+#
+#     if not beams:
+#         return None
+#
+#     # Process best beam
+#     best_beam = beams[0]
+#     t = best_beam.time_index
+#     j = best_beam.token_index
+#
+#     # Complete path to t=0 efficiently (single loop)
+#     while t > 0:
+#         t -= 1
+#         best_beam.path.append(Point(j, t, math.exp(blank_emission[t])))
+#
+#     return best_beam.path[::-1]
 
 # Merge the labels
 @dataclass
