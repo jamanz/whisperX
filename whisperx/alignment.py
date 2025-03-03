@@ -1928,6 +1928,7 @@ class BeamState:
 
 
 # @nb.jit(nopython=True, parallel=True)
+
 def backtrack_beam(trellis, emission, tokens, blank_id=0, beam_width=5):
     """Standard CTC beam search backtracking implementation."""
     T, J = trellis.size(0) - 1, trellis.size(1) - 1
